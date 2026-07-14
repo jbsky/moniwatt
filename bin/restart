@@ -1,0 +1,3 @@
+ cat bin/restart
+#!/bin/bash
+XDG_RUNTIME_DIR="/run/user/$(id -u compteur)" systemctl --user restart compteur-mqtt

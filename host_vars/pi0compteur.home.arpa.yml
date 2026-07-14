@@ -1,0 +1,3 @@
+---
+# Valeur réelle historique : ce Pi a été déployé en tant que 2e instance moniwatt.
+moniwatt_service_description: "Compteur 2 MQTT"

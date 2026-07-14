@@ -1,0 +1,157 @@
+---
+- hosts: moniwatt
+  gather_facts: no
+  pre_tasks:
+    - name: Résoudre les variables (defaults génériques, surchargeables via host_vars/group_vars)
+      # set_fact + default() plutôt qu'un bloc vars: du play : les vars de play ont une
+      # précédence plus haute que group_vars/host_vars d'inventaire, ce qui empêcherait
+      # justement l'inventaire de les surcharger (un vars: ici rendrait host_vars muet).
+      set_fact:
+        # Utilisateur système propriétaire du service et de sendPower.py.
+        moniwatt_user: "{{ moniwatt_user | default('compteur') }}"
+        # UID de moniwatt_user, requis pour XDG_RUNTIME_DIR (systemd --user sans session
+        # de login active).
+        moniwatt_uid: "{{ moniwatt_uid | default(1001) }}"
+        # Nom de l'unit systemd --user.
+        moniwatt_service_name: "{{ moniwatt_service_name | default('compteur-mqtt') }}"
+        # Description humaine du service (Description= dans l'unit file).
+        moniwatt_service_description: "{{ moniwatt_service_description | default('Compteur MQTT') }}"
+        # Port ciblé pour lancer le reset (fuser+touch) AVANT le flash. upload.sh
+        # re-détecte le port réel après reset, au cas où l'USB ré-énumère ailleurs
+        # (vécu : le Mega peut réapparaître en /dev/ttyACM1).
+        arduino_serial_port: "{{ arduino_serial_port | default('/dev/ttyACM0') }}"
+        # Chemins de déploiement, rarement à surcharger mais variabilisés par cohérence
+        # (évite qu'ExecStart= et le dest: du copy divergent silencieusement).
+        moniwatt_bin_dest: "{{ moniwatt_bin_dest | default('/usr/local/bin/sendPower.py') }}"
+        moniwatt_arduino_dest: "{{ moniwatt_arduino_dest | default('/root/ads1115/ads1115.ino') }}"
+        moniwatt_upload_script_dest: "{{ moniwatt_upload_script_dest | default('/root/upload.sh') }}"
+
+    - name: Dériver XDG_RUNTIME_DIR une seule fois (au lieu de /run/user/{{ moniwatt_uid }} recalculé partout)
+      set_fact:
+        xdg_runtime_dir: "/run/user/{{ moniwatt_uid }}"
+
+  tasks:
+    - name: Créer répertoire systemd user
+      file:
+        path: "/home/{{ moniwatt_user }}/.config/systemd/user"
+        state: directory
+        owner: "{{ moniwatt_user }}"
+        group: "{{ moniwatt_user }}"
+      become: yes
+
+    - name: Créer service file
+      copy:
+        dest: "/home/{{ moniwatt_user }}/.config/systemd/user/{{ moniwatt_service_name }}.service"
+        owner: "{{ moniwatt_user }}"
+        group: "{{ moniwatt_user }}"
+        content: |
+          [Unit]
+          Description={{ moniwatt_service_description }}
+          After=network-online.target
+
+          [Service]
+          Restart=always
+          ExecStart={{ moniwatt_bin_dest }}
+
+          [Install]
+          WantedBy=default.target
+      become: yes
+
+    - name: Enable service
+      systemd:
+        name: "{{ moniwatt_service_name }}"
+        enabled: yes
+        scope: user
+        daemon_reload: yes
+      become: yes
+      become_user: "{{ moniwatt_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "{{ xdg_runtime_dir }}"
+
+    - name: Déployer sendPower.py
+      copy:
+        src: bin/sendPower.py
+        dest: "{{ moniwatt_bin_dest }}"
+        owner: root
+        group: root
+        mode: "0755"
+      become: yes
+      notify: Restart service
+
+    - name: Déployer le sketch Arduino
+      copy:
+        src: ads1115/ads1115.ino
+        dest: "{{ moniwatt_arduino_dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      become: yes
+      notify:
+        - Stop service avant flash
+        - Compiler et flasher Arduino
+        - Restart service après flash
+
+    - name: Déployer upload.sh
+      copy:
+        src: bin/upload.sh
+        dest: "{{ moniwatt_upload_script_dest }}"
+        owner: root
+        group: root
+        mode: "0755"
+      become: yes
+
+  handlers:
+    # Ordre d'exécution = ordre de déclaration ci-dessous (pas l'ordre de notify),
+    # donc un run qui touche à la fois sendPower.py et ads1115.ino exécute
+    # stop -> flash -> start -> restart (redondant mais inoffensif).
+    - name: Stop service avant flash
+      # sendPower.py tient le port série ouvert en continu (boucle de lecture série).
+      # upload.sh fait aussi un fuser -k par sécurité, mais un stop propre en amont
+      # évite que Restart=always ne le fasse respawn pendant le flash.
+      #
+      # become_user SEUL ne suffit pas : sans become:yes, Ansible reste connecté
+      # en tant que root (utilisateur SSH par défaut) et ignore become_user
+      # silencieusement -- ce qui pilote alors le systemd --user de ROOT, pas
+      # celui de moniwatt_user (vécu : ça a fait tourner un service fantôme sous
+      # root en parallèle du vrai, corrompant le flux série).
+      systemd:
+        name: "{{ moniwatt_service_name }}"
+        scope: user
+        state: stopped
+      become: yes
+      become_user: "{{ moniwatt_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "{{ xdg_runtime_dir }}"
+
+    - name: Compiler et flasher Arduino
+      # Reflash uniquement si ads1115.ino a réellement changé (pattern notify),
+      # pour éviter un reset Arduino inutile à chaque run. Le reset provoqué par
+      # un flash reste sans risque de perte de données grâce au resync idx/cum
+      # de sendPower.py (voir check_arduino_sequence).
+      #
+      # NE PAS appeler arduino-cli --upload directement : le simple toggle DTR
+      # qu'il déclenche ne suffit pas à faire entrer ce Mega en mode bootloader
+      # depuis ce Pi (vécu : timeout stk500v2 systématique). upload.sh fait un
+      # fuser -k du port + un "touch 1200 bauds" (stty) qui, eux, marchent.
+      command: "{{ moniwatt_upload_script_dest }} {{ arduino_serial_port }}"
+      become: yes
+
+    - name: Restart service après flash
+      systemd:
+        name: "{{ moniwatt_service_name }}"
+        scope: user
+        state: started
+      become: yes
+      become_user: "{{ moniwatt_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "{{ xdg_runtime_dir }}"
+
+    - name: Restart service
+      systemd:
+        name: "{{ moniwatt_service_name }}"
+        scope: user
+        state: restarted
+      become: yes
+      become_user: "{{ moniwatt_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "{{ xdg_runtime_dir }}"

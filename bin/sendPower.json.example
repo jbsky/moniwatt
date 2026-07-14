@@ -1,0 +1,29 @@
+{
+  "mqtt": {
+    "broker": "192.168.x.x",
+    "port": 1883,
+    "username": "CHANGEME",
+    "password": "CHANGEME",
+    "base_topic": "homeassistant"
+  },
+  "device": {
+    "model": "pi0",
+    "manufacturer": "JBsky"
+  },
+  "system": {
+    "debug": false,
+    "log_file": "/var/log/compteur/sensor_monitor.log",
+    "energy_save_file": "/var/lib/compteur/current_sensor_energy.pkl",
+    "baudrate": 115200
+  },
+  "electrical": {
+    "voltage_rms": 240,
+    "send_interval": 30
+  },
+  "sensors": {
+    "adc1": {"amp": 5, "desc": "Circuit 1"},
+    "adc2": {"amp": 10, "desc": "Circuit 2"},
+    "adc3": {"amp": 20, "desc": "Circuit 3"},
+    "adc4": {"amp": 5, "desc": "Circuit 4"}
+  }
+}
